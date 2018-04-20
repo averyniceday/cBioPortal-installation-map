@@ -21,6 +21,7 @@ function sync() {
   init();
 
   // Get the data in the spreadsheet and convert it to a dictionary.
+  // dictionary where rowId is mapped to each record {1:{Person1:"NAME", Location:"PLACE", ...]}
   var sheet = SpreadsheetApp.getActiveSheet();
   var lastRow = sheet.getLastRow();
   var lastColumn = sheet.getLastColumn();
@@ -41,77 +42,85 @@ function sync() {
     }
   }
 
-  // Get the data from the table and convert to a dictionary.
+  // Get the data from the fusion table and convert to a dictionary.
+  // dictionary where recordId is mapped to each record {1:[Person1, Location, ...]}
   var query = "SELECT '" + escapedColumns.join("','") + "' FROM " + DOCID;
   var ftResults = runSqlWithRetry(query);
   if (!ftResults) {
     return;
   }
   var ftMap = mapRowsByRowId(ftResults.columns, ftResults.rows);
-  
-  // For each row in the Fusion Table, find if the row still exists in the
-  // spreadsheet. If it exists, make sure the values are the same. If
-  // they are different, update the Fusion Table data.
-  // If the row doesn't exist in the spreadsheet, delete the row from the table.
-  // If record has changed and doesn't want to be displayed, delete from fusion table
+
+  // Iterate through rowIds/records in Fusion Table
+  // check if rowId/record still exists in spreadsheet/still wants to show up on the map
+  // for existing records that want to be shown - update data with any changes
+  // if rowId no longer found/no longer wants to be put on map - delete from Fusion Table
   for (var rowId in ftMap) {
-    var spreadsheetRow = spreadsheetMap[rowId];
-    if (spreadsheetRow && spreadsheetRow["Put me on the Map\?"] != "No") {
-      var updates = [];
-      var tableRow = ftMap[rowId];
+    var spreadsheetRows = spreadsheetMap[rowId]
+    if (spreadsheetRows) {
+      for (var i = 0; spreadsheetRows && i < spreadsheetRows.length; i++) {
+        var spreadsheetRow = spreadsheetRows[i];
+        if (spreadsheetRow && spreadsheetRow["Put me on the Map\?"] != "No") {
+          var updates = [];
+          var tableRow = ftMap[rowId][0];
 
-      for (var column in tableRow) {
-        if (column === 'rowid' || column == 'spreadsheetRowNum') {
-          continue;
-        }
-        var tableValue = tableRow[column];
-        var spreadsheetValue = spreadsheetRow[column];
-        if (tableValue != spreadsheetValue) {
-          spreadsheetValue = processSpreadsheetValue(column, spreadsheetValue, updates, true);
+          for (var column in tableRow) {
+            if (column === 'rowid' || column == 'spreadsheetRowNum') {
+              continue;
+            }
+            var tableValue = tableRow[column];
+            var spreadsheetValue = spreadsheetRow[column];
+            if (tableValue != spreadsheetValue) {
+              spreadsheetValue = processSpreadsheetValue(column, spreadsheetValue, updates, true);
+            }
+          }
+
+          // If there are updates, send the UPDATE query.
+          if (updates.length) {
+            var query = [];
+            query.push('UPDATE ');
+            query.push(DOCID);
+            query.push(' SET ');
+            query.push(updates.join(','));
+            query.push(" WHERE rowid = '");
+            query.push(rowId);
+            query.push("'");
+            runSqlWithRetry(query.join(''));
+            waitBetweenCalls();
+          }
+
+        } else {
+          // If the row doesn't exist in the spreadsheet, delete it from the table
+          runSqlWithRetry('DELETE FROM ' + DOCID + " WHERE rowid = '" +
+              rowId + "'");
+          waitBetweenCalls();
         }
       }
-
-      // If there are updates, send the UPDATE query.
-      if (updates.length) {
-        var query = [];
-        query.push('UPDATE ');
-        query.push(DOCID);
-        query.push(' SET ');
-        query.push(updates.join(','));
-        query.push(" WHERE rowid = '");
-        query.push(rowId);
-        query.push("'");
-        runSqlWithRetry(query.join(''));
-        waitBetweenCalls();
-      }
-
     } else {
-      // If the row doesn't exist in the spreadsheet, delete it from the table
       runSqlWithRetry('DELETE FROM ' + DOCID + " WHERE rowid = '" +
           rowId + "'");
       waitBetweenCalls();
     }
   }
-  
-  // Insert data that was originally not included
-  for (var rowId in spreadsheetMap) {
-    if (!(rowId in ftMap) && (spreadsheetMap[rowId]["Put me on the Map\?"] != "No")) {
-      var tempId = createRecord(spreadsheetMap[rowId]);
-      insertRowId(tempId, spreadsheetMap[rowId].spreadsheetRowNum);
-    }
-  }
-               
 
-  // Insert all the data into the Fusion Table that failed to insert.
-  // These rows were given a rowid of -1 or have a blank rowid.
-  var failedInserts = spreadsheetMap[-1];
-  for (var i = 0; failedInserts && i < failedInserts.length; i++) {
-    var rowId = createRecord(failedInserts[i]);
-    if (!rowId) {
-      rowId = -1;
+  // iterate through rowIds in spreadsheet
+  // check if it already exists in Fusion Table and wants to be shown
+  // records that aren't already in Fusion Table map are inserted into table
+  // rowId updated with matching rowId in Fusion Table
+  for (var rowId in spreadsheetMap) {
+    if (!(rowId in ftMap)) {
+      var newRecordsToAdd = spreadsheetMap[rowId]
+      for (var i = 0; newRecordsToAdd && i < newRecordsToAdd.length; i++) {
+        if (newRecordsToAdd[i]["Put me on the Map\?"] != "No") {
+          var tempId = createRecord(newRecordsToAdd[i]);
+          if (!tempId) {
+            tempId = -1;
+          }
+          insertRowId(tempId, newRecordsToAdd[i].spreadsheetRowNum);
+          waitBetweenCalls();
+        }
+      }
     }
-    insertRowId(rowId, failedInserts[i].spreadsheetRowNum);
-    waitBetweenCalls();
   }
 }
 
@@ -135,6 +144,8 @@ function onFormSubmit(e) {
   var formValues = e.namedValues;
 
   // Insert the data into the Fusion Table.
+  // If an error occurs, rowId set to -1 (faulty records for sync())
+  // If not opting in to being shwon, rowId set to -100
   if (formValues["Put me on the Map\?"] != "No") {
     var rowId = createRecord(formValues);
     if (!rowId) {
@@ -142,7 +153,7 @@ function onFormSubmit(e) {
     }
     insertRowId(rowId, row);
   } else {
-    insertRowId(-100, row);
+    insertRowId(-1, row);
   }
 }
 
@@ -386,7 +397,7 @@ function mapRowsByRowId(columns, rows) {
       map[-1].push(columnMap);
     } else {
       columnMap.spreadsheetRowNum = i + 2;
-      map[rowId] = columnMap;
+      map[rowId] = [columnMap];
     }
   }
   return map;
